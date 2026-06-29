@@ -7,6 +7,7 @@ import {
 
 const MODULE_ID = "multi-hit-spell-lvl-scaler";
 const DEBUG_SETTING = "debug";
+const MIDI_WORKFLOW_COMPLETION_TIMEOUT_MS = 8000;
 
 function getModuleVersion() {
   return game?.modules?.get?.(MODULE_ID)?.version ?? "dev";
@@ -40,6 +41,10 @@ function warn(...args) {
 
 function info(...args) {
   console.info(getLogPrefix(), ...args);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeNonNegativeInteger(value, fallback = null) {
@@ -176,6 +181,10 @@ async function resolveTokenDocumentFromSnapshot(snapshot) {
   }
 
   return null;
+}
+
+function resolveTokenObjectFromDocument(tokenDocument) {
+  return tokenDocument?.object ?? tokenDocument ?? null;
 }
 
 async function applyUserTargetSnapshots(targetSnapshots = []) {
@@ -464,7 +473,11 @@ function getSpellSlotForContext(context, item) {
 }
 
 // Keep non-consumption options isolated so we can adjust dnd5e integration later without touching the executor flow.
-function buildExtraHitUsageConfig(context, item, options = {}) {
+function buildExtraHitUsageConfig(context, item, targetSnapshot, targetObject = null, options = {}) {
+  const targetUuids = [targetSnapshot?.tokenUuid].filter(Boolean);
+  const targetIds = [targetSnapshot?.tokenId].filter(Boolean);
+  const targetsToUse = targetObject ? new Set([targetObject]) : new Set();
+
   return {
     consume: false,
     create: false,
@@ -475,6 +488,18 @@ function buildExtraHitUsageConfig(context, item, options = {}) {
     scaling: normalizeNonNegativeInteger(context?.spell?.scaling, 0) ?? 0,
     spell: {
       slot: getSpellSlotForContext(context, item)
+    },
+    targets: targetsToUse,
+    targetIds,
+    targetUuids,
+    midiOptions: {
+      ...cloneData(options.midiOptions ?? {}),
+      targetUuids,
+      targetsToUse,
+      workflowOptions: {
+        ...cloneData(options.midiOptions?.workflowOptions ?? {}),
+        targetConfirmation: "none"
+      }
     },
     subsequentActions: options.subsequentActions ?? true,
     event: options.event,
@@ -514,6 +539,31 @@ function buildExtraHitMessageConfig(context, targetSnapshot, options = {}) {
   };
 }
 
+function createTargetDescriptor(targetSnapshot, tokenObject = null) {
+  if (!targetSnapshot?.actorUuid) {
+    return null;
+  }
+
+  const actor = tokenObject?.actor ?? tokenObject?.document?.actor ?? null;
+
+  return {
+    name: targetSnapshot.name ?? actor?.name ?? "",
+    img: actor?.img ?? actor?.prototypeToken?.texture?.src ?? "",
+    uuid: targetSnapshot.actorUuid,
+    ac: actor?.statuses?.has?.("coverTotal") ? null : (actor?.system?.attributes?.ac?.value ?? null)
+  };
+}
+
+function forceSingleTargetMessageConfig(messageConfig, targetSnapshot, tokenObject = null) {
+  const descriptor = createTargetDescriptor(targetSnapshot, tokenObject);
+
+  if (descriptor) {
+    foundry.utils.setProperty(messageConfig, "data.flags.dnd5e.targets", [descriptor]);
+  }
+
+  return messageConfig;
+}
+
 function buildFailureResult(contextId, context, reason, message, details = undefined) {
   if (message) {
     notifyWarn(message, details);
@@ -533,6 +583,98 @@ function buildFailureResult(contextId, context, reason, message, details = undef
   };
 }
 
+function getResultMessageUuid(results) {
+  return typeof results?.message?.uuid === "string"
+    ? results.message.uuid
+    : null;
+}
+
+function getMidiWorkflow(messageUuid) {
+  return globalThis.MidiQOL?.Workflow?.getWorkflow?.(messageUuid) ?? null;
+}
+
+function isMidiWorkflowForMessage(workflow, messageUuid) {
+  return Boolean(messageUuid)
+    && ((workflow?.id === messageUuid) || (workflow?.itemCardUuid === messageUuid));
+}
+
+export async function waitForMidiWorkflowCompletion(results, details = {}) {
+  if (!game?.modules?.get?.("midi-qol")?.active) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "midi-qol-inactive"
+    };
+  }
+
+  const messageUuid = getResultMessageUuid(results);
+
+  if (!messageUuid || typeof Hooks?.on !== "function" || typeof Hooks?.off !== "function") {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "missing-message-or-hooks"
+    };
+  }
+
+  const existingWorkflow = getMidiWorkflow(messageUuid);
+
+  if (!existingWorkflow) {
+    await delay(100);
+
+    if (!getMidiWorkflow(messageUuid)) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: "workflow-not-found",
+        messageUuid
+      };
+    }
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let hookId = null;
+
+    const finish = (result) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timeoutId);
+
+      if (hookId !== null) {
+        Hooks.off("midi-qol.RollComplete", hookId);
+      }
+
+      resolve(result);
+    };
+
+    const timeoutId = setTimeout(() => {
+      finish({
+        ok: false,
+        timedOut: true,
+        messageUuid,
+        ...details
+      });
+    }, MIDI_WORKFLOW_COMPLETION_TIMEOUT_MS);
+
+    hookId = Hooks.on("midi-qol.RollComplete", (workflow) => {
+      if (!isMidiWorkflowForMessage(workflow, messageUuid)) {
+        return;
+      }
+
+      finish({
+        ok: true,
+        messageUuid,
+        workflowId: workflow?.id ?? null,
+        ...details
+      });
+    });
+  });
+}
+
 async function useExtraActivityForTarget(context, item, hitActivity, targetSnapshot, options = {}) {
   const restoreTargetSnapshots = Array.isArray(options.restoreTargetSnapshots)
     ? options.restoreTargetSnapshots.map((snapshot) => cloneData(snapshot))
@@ -544,18 +686,34 @@ async function useExtraActivityForTarget(context, item, hitActivity, targetSnaps
   }
 
   try {
-    const usageConfig = buildExtraHitUsageConfig(context, item, options);
+    const targetDocument = await resolveTokenDocumentFromSnapshot(targetSnapshot);
+    const targetObject = resolveTokenObjectFromDocument(targetDocument);
+    const usageConfig = buildExtraHitUsageConfig(context, item, targetSnapshot, targetObject, options);
     const dialogConfig = buildExtraHitDialogConfig(options);
-    const messageConfig = buildExtraHitMessageConfig(context, targetSnapshot, options);
+    const messageConfig = forceSingleTargetMessageConfig(
+      buildExtraHitMessageConfig(context, targetSnapshot, options),
+      targetSnapshot,
+      targetObject
+    );
 
     debug("Resolving a controlled hit with a forced single-target selection.", {
       contextId: context?.id ?? null,
       target: targetSnapshot,
+      forcedTargetCount: targetObject ? 1 : 0,
+      forcedTargetUuids: usageConfig.targetUuids,
       hitActivity: summarizeActivity(hitActivity),
       nativeTargetCount: normalizeNonNegativeInteger(hitActivity?.target?.affects?.count, 1) ?? 1
     });
 
     const results = await hitActivity.use(usageConfig, dialogConfig, messageConfig);
+    const completionResult = await waitForMidiWorkflowCompletion(results, {
+      contextId: context?.id ?? null,
+      target: cloneData(targetSnapshot)
+    });
+
+    if (!completionResult.ok) {
+      debug("Timed out waiting for Midi-QOL workflow completion before changing controlled hit target.", completionResult);
+    }
 
     return {
       ok: true,
@@ -814,27 +972,46 @@ export async function resolveRemainingExtraHits(contextId, options = {}) {
     limited: false
   });
 
-  for (const targetSnapshot of targetSequence.targets) {
-    const result = await resolveNextExtraHit(contextId, {
-      ...options,
-      targetSnapshot,
-      restoreTargetSnapshots: targetSequence.restoreTargetSnapshots
-    });
-    iterations.push(result);
+  try {
+    for (const targetSnapshot of targetSequence.targets) {
+      const result = await resolveNextExtraHit(contextId, {
+        ...options,
+        targetSnapshot,
+        restoreTargetSnapshots: [cloneData(targetSnapshot)]
+      });
+      iterations.push(result);
 
-    if (!result.ok) {
-      return {
-        ok: false,
-        contextId,
-        context: getCastContext(contextId),
-        iterations,
-        completed: false,
-        reason: result.reason
-      };
+      if (!result.ok) {
+        return {
+          ok: false,
+          contextId,
+          context: getCastContext(contextId),
+          iterations,
+          completed: false,
+          reason: result.reason
+        };
+      }
+
+      if (result.completed) {
+        break;
+      }
     }
+  } finally {
+    const lastIteration = iterations[iterations.length - 1] ?? null;
+    const finalRestoreTargetSnapshots = lastIteration?.target
+      ? [cloneData(lastIteration.target)]
+      : [];
 
-    if (result.completed) {
-      break;
+    if (finalRestoreTargetSnapshots.length) {
+      const restoreResult = await applyUserTargetSnapshots(finalRestoreTargetSnapshots);
+
+      if (!restoreResult.ok) {
+        debug("Unable to restore final single-target selection after resolving remaining extra hits.", {
+          contextId,
+          finalRestoreTargetSnapshots,
+          restoreResult
+        });
+      }
     }
   }
 

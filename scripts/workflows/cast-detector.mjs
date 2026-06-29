@@ -3,7 +3,10 @@ import { debug, getSpellConfig, warn } from "../module.mjs";
 import { createCastContext, getCastContext } from "../runtime/cast-context.mjs";
 import { promptExtraHitResolution } from "./extra-hit-prompt.mjs";
 import { computeExtraHitCount } from "./extra-hit-count.mjs";
-import { resolveNextExtraHit } from "./extra-hit-executor.mjs";
+import {
+  resolveNextExtraHit,
+  waitForMidiWorkflowCompletion
+} from "./extra-hit-executor.mjs";
 
 const PRE_CAST_GUARD_HOOK = "dnd5e.preUseActivity";
 const CAST_DETECTOR_HOOK = "dnd5e.postUseActivity";
@@ -178,6 +181,27 @@ function setUsageMessageTargets(messageConfig, targetSnapshots = []) {
     .filter(Boolean);
 
   foundry.utils.setProperty(messageConfig, "data.flags.dnd5e.targets", descriptors);
+}
+
+function forceSingleTargetUsageConfig(usageConfig, targetSnapshot) {
+  const tokenObject = resolveTokenObjectFromSnapshot(targetSnapshot);
+  const targetUuids = [targetSnapshot?.tokenUuid].filter(Boolean);
+  const targetIds = [targetSnapshot?.tokenId].filter(Boolean);
+
+  usageConfig.targets = tokenObject ? new Set([tokenObject]) : new Set();
+  usageConfig.targetIds = targetIds;
+  usageConfig.targetUuids = targetUuids;
+  usageConfig.midiOptions = {
+    ...clonePlainObject(usageConfig.midiOptions ?? {}),
+    targetUuids,
+    targetsToUse: tokenObject ? new Set([tokenObject]) : new Set(),
+    workflowOptions: {
+      ...clonePlainObject(usageConfig.midiOptions?.workflowOptions ?? {}),
+      targetConfirmation: "none"
+    }
+  };
+
+  return usageConfig;
 }
 
 function resolveItem(activity, actor) {
@@ -398,6 +422,7 @@ async function resolveConfiguredInitialCast(activity, usageConfig = {}, dialogCo
   }
 
   const originalTargetSnapshots = getCurrentUserTargetSnapshots().map((snapshot) => cloneData(snapshot));
+  let finalRestoreTargetSnapshots = originalTargetSnapshots;
   const manualUsageConfig = buildControlledBaseUsageConfig(usageConfig);
   const manualDialogConfig = buildControlledBaseDialogConfig(dialogConfig);
 
@@ -471,6 +496,7 @@ async function resolveConfiguredInitialCast(activity, usageConfig = {}, dialogCo
     }
 
     const firstTargetSnapshot = initialTargetSnapshots[0];
+    finalRestoreTargetSnapshots = [cloneData(firstTargetSnapshot)];
     const firstSelectionResult = await applyUserTargetSnapshots([firstTargetSnapshot]);
 
     if (!firstSelectionResult.ok) {
@@ -487,7 +513,7 @@ async function resolveConfiguredInitialCast(activity, usageConfig = {}, dialogCo
     }
 
     const baseResults = await controlledActivity.use(
-      manualUsageConfig,
+      forceSingleTargetUsageConfig(manualUsageConfig, firstTargetSnapshot),
       manualDialogConfig,
       buildControlledBaseMessageConfig(firstTargetSnapshot, messageConfig, {
         totalHits,
@@ -495,6 +521,14 @@ async function resolveConfiguredInitialCast(activity, usageConfig = {}, dialogCo
         hitIndex: 1
       })
     );
+    const baseCompletionResult = await waitForMidiWorkflowCompletion(baseResults, {
+      contextId: null,
+      target: cloneData(firstTargetSnapshot)
+    });
+
+    if (!baseCompletionResult.ok) {
+      debug("Timed out waiting for Midi-QOL workflow completion before resolving the next controlled initial hit.", baseCompletionResult);
+    }
 
     if (!baseResults) {
       debug("Controlled initial cast did not complete and no hit context was created.", {
@@ -559,6 +593,7 @@ async function resolveConfiguredInitialCast(activity, usageConfig = {}, dialogCo
         break;
       }
 
+      finalRestoreTargetSnapshots = [cloneData(targetSnapshot)];
       castContext = nextHitResult.context ?? getCastContext(castContext.id) ?? null;
     }
 
@@ -569,14 +604,14 @@ async function resolveConfiguredInitialCast(activity, usageConfig = {}, dialogCo
       promptExtraHitResolution(remainingContext.id);
     }
   } finally {
-    const restoreResult = await applyUserTargetSnapshots(originalTargetSnapshots);
+    const restoreResult = await applyUserTargetSnapshots(finalRestoreTargetSnapshots);
 
     if (!restoreResult.ok) {
-      debug("Unable to restore the original target selection after controlled hit allocation.", {
+      debug("Unable to restore the final single-target selection after controlled hit allocation.", {
         hook: PRE_CAST_GUARD_HOOK,
         item: summarizeDocument(item, "item"),
         activity: summarizeDocument(controlledActivity, "activity"),
-        originalTargetSnapshots,
+        finalRestoreTargetSnapshots,
         restoreResult
       });
     }
