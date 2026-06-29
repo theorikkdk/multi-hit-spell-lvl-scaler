@@ -2,7 +2,7 @@
   "id": "multi-hit-spell-lvl-scaler",
   "title": "Multi-Hit Spell Level Scaler",
   "description": "Lets selected dnd5e spells scale with additional single-target hits instead of increasing damage per hit.",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "authors": [
     {
       "name": "theorikkdk",
